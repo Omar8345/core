@@ -16,20 +16,35 @@ export function applyTracesFromSolverOutput(args: {
   const { group, solver, pinIdToSchematicPortId, userNetIdToSck } = args
   const { db } = group.root!
 
-  // Use the overlap-corrected traces from the pipeline
-  const traces =
-    solver.traceLabelOverlapAvoidanceSolver?.getOutput().traces ??
-    solver.schematicTraceLinesSolver?.solvedTracePaths
+  // Prefer overlap-corrected traces (produced by traceOverlapShiftSolver)
+  // when present. Otherwise fall back to the previous solver outputs.
+  const correctedMap = solver.traceOverlapShiftSolver?.correctedTraceMap
+  // traceLabelOverlapAvoidanceSolver.getOutput() returns an object with a
+  // `traceMap` (Map) and other helpers; use its values when available.
+  const fallbackTracesFromLabelSolver =
+    solver.traceLabelOverlapAvoidanceSolver?.getOutput().traceMap
+  const fallbackTraces = fallbackTracesFromLabelSolver
+    ? Array.from(fallbackTracesFromLabelSolver.values())
+    : solver.schematicTraceLinesSolver?.solvedTracePaths
+  const traces = correctedMap ? Object.values(correctedMap) : fallbackTraces
+
   const pendingTraces: Array<{
     source_trace_id: string
     edges: SchematicTrace["edges"]
     subcircuit_connectivity_map_key?: string
   }> = []
 
-  debug(`Traces inside SchematicTraceSolver output: ${(traces ?? []).length}`)
+  debug(
+    `Traces inside SchematicTraceSolver output: ${
+      Object.values(correctedMap ?? {}).length
+    }`,
+  )
 
   for (const solvedTracePath of traces ?? []) {
-    const points = solvedTracePath?.tracePath as Array<{ x: number; y: number }>
+    const points = solvedTracePath?.tracePath as Array<{
+      x: number
+      y: number
+    }>
     if (!Array.isArray(points) || points.length < 2) {
       debug(
         `Skipping trace ${solvedTracePath?.pinIds.join(",")} because it has less than 2 points`,
@@ -69,7 +84,7 @@ export function applyTracesFromSolverOutput(args: {
 
     if (!source_trace_id) {
       source_trace_id = `solver_${solvedTracePath?.mspPairId!}`
-      subcircuit_connectivity_map_key = userNetIdToSck.get(
+      subcircuit_connectivity_map_key = subcircuit_connectivity_map_key ?? userNetIdToSck.get(
         String(solvedTracePath.userNetId),
       )
     }
@@ -92,7 +107,20 @@ export function applyTracesFromSolverOutput(args: {
       edges: t.edges,
     })),
   )
-  const junctionsById = computeJunctions(withCrossings)
+
+  const junctionsById = computeJunctions(
+    withCrossings.map((t) => ({
+      source_trace_id: t.source_trace_id,
+      edges: t.edges,
+      // Preserve the per-trace connectivity key so the junction logic can
+      // avoid creating junctions between traces that belong to the same
+      // subcircuit/network (this is the behavioral fix from the feature
+      // branch).
+      subcircuit_connectivity_map_key: pendingTraces.find(
+        (p) => p.source_trace_id === t.source_trace_id,
+      )?.subcircuit_connectivity_map_key,
+    })),
+  )
 
   for (const t of withCrossings) {
     db.schematic_trace.insert({
